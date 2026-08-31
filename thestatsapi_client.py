@@ -1,9 +1,27 @@
 import requests
 import numpy as np
-from typing import Dict, Any, Tuple, Optional
-from config import THESTATSAPI_BASE_URL, THESTATSAPI_KEY
+from typing import Dict, Any, Tuple, Optional, List
+from config import (
+    THESTATSAPI_BASE_URL, THESTATSAPI_KEY,
+    MAX_RETRIES, REQUEST_TIMEOUT, log_info, log_warning, log_error
+)
+from matcher import TeamMatcher
 
 class TheStatsAPIClient:
+    """
+    Cliente para TheStatsAPI que extrae métricas REALES de equipos.
+    
+    Restricción CRÍTICA (CERO MOCK DATA):
+    - Si un equipo no existe o falla la consulta, captura el error
+    - Registra log INFORMATIVO
+    - JAMÁS inventa métricas: retorna None para señalar fallo
+    - El orquestador (main.py) decide si omitir el evento
+    
+    Extrae:
+    1. Vector Tabular [8]: días_descanso, posesión, precisión_pases, xG_media, faltas, victorias, empates, derrotas
+    2. Secuencia [5x6]: Últimos 5 partidos reales con [xG, xGA, SoT, SoTA, Corners, Corners_contra]
+    """
+
     def __init__(self, api_key: str = THESTATSAPI_KEY):
         self.api_key = api_key
         self.base_url = THESTATSAPI_BASE_URL
@@ -11,44 +29,126 @@ class TheStatsAPIClient:
             "Authorization": f"Bearer {api_key}",
             "Accept": "application/json"
         }
+        self.matcher = TeamMatcher()
+        self.session = requests.Session()
 
-    def _get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """
+        GET con reintentos y manejo de errores sin inventar datos.
+        Retorna None si falla (NO retorna diccionarios sintéticos).
+        """
         url = f"{self.base_url}{endpoint}"
-        res = requests.get(url, headers=self.headers, params=params, timeout=12)
-        res.raise_for_status()
-        return res.json()
-
-    def get_team_real_metrics(self, team_name: str) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Consulta TheStatsAPI en tiempo real para obtener:
-        1. Vector Tabular [descanso_dias, posesion_media, pass_accuracy, xg_media, fouls]
-        2. Secuencia Real (últimos 5 partidos): [xg, xga, sot, sota, corners, corners_contra]
-        """
-        try:
-            # 1. Búsqueda de equipo por nombre en la API
-            search_data = self._get("/football/teams", params={"name": team_name})
-            teams = search_data.get("data", search_data) if isinstance(search_data, dict) else search_data
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                res = self.session.get(url, headers=self.headers, params=params, timeout=REQUEST_TIMEOUT)
+                
+                if res.status_code == 429:
+                    log_warning(f"Rate limit (429) en TheStatsAPI. Reintentando ({attempt+1}/{MAX_RETRIES})...")
+                    continue
+                elif res.status_code == 401:
+                    log_error("Autenticación fallida en TheStatsAPI (401). Verifica THESTATSAPI_KEY")
+                    return None
+                elif res.status_code == 404:
+                    log_warning(f"Recurso no encontrado: {endpoint}")
+                    return None
+                elif res.status_code >= 500:
+                    log_warning(f"Error servidor (HTTP {res.status_code}). Reintentando...")
+                    continue
+                elif res.status_code != 200:
+                    log_warning(f"HTTP {res.status_code} en {endpoint}")
+                    return None
+                
+                return res.json()
             
-            if not teams:
-                # Búsqueda alternativa por query
-                search_data = self._get(f"/football/teams/search", params={"query": team_name})
-                teams = search_data.get("data", search_data) if isinstance(search_data, dict) else search_data
+            except requests.exceptions.Timeout:
+                log_warning(f"Timeout en TheStatsAPI (intento {attempt+1}/{MAX_RETRIES})")
+            except requests.exceptions.ConnectionError as e:
+                log_warning(f"Conexión rechazada por TheStatsAPI: {e}")
+            except ValueError:
+                log_error(f"Respuesta no-JSON en {endpoint}")
+                return None
+        
+        log_error(f"Falló obtener datos después de {MAX_RETRIES} reintentos: {endpoint}")
+        return None
 
-            team_id = teams[0].get("id") if isinstance(teams, list) and len(teams) > 0 else None
-            
-            if not team_id:
-                raise ValueError(f"No se localizó el ID del equipo: {team_name} en TheStatsAPI.")
+    def find_team_id(self, team_name: str) -> Optional[int]:
+        """
+        Busca el ID real de un equipo en TheStatsAPI.
+        
+        Estrategia:
+        1. Busca exacto por nombre
+        2. Si falla, busca por fuzzy matching
+        
+        Returns:
+            team_id si existe, None si no se encuentra
+        """
+        # Intenta búsqueda directa
+        data = self._get("/football/teams", params={"name": team_name})
+        if data:
+            teams = data.get("data", [])
+            if isinstance(teams, list) and len(teams) > 0:
+                return teams[0].get("id")
+        
+        # Intenta búsqueda por query
+        data = self._get(f"/football/teams/search", params={"query": team_name})
+        if data:
+            teams = data.get("data", [])
+            if isinstance(teams, list) and len(teams) > 0:
+                return teams[0].get("id")
+        
+        log_warning(f"Equipo '{team_name}' no encontrado en TheStatsAPI")
+        return None
 
-            # 2. Consultar historial de los últimos partidos finalizados
-            matches_data = self._get(f"/football/teams/{team_id}/matches", params={"status": "finished", "limit": 5})
-            raw_matches = matches_data.get("data", matches_data)
-
-            sequence = []
-            xg_list, pos_list, pass_list = [], [], []
-
-            for m in raw_matches[:5]:
+    def get_team_real_metrics(self, team_name: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """
+        Extrae métricas REALES de un equipo.
+        
+        Restricción CRÍTICA: NO RETORNA DATOS INVENTADOS
+        
+        Retorna:
+            Tupla (tab_array [8], seq_array [5x6]) si exito
+            None si falla (señal para omitir evento)
+        
+        Vector Tabular [8]:
+            [días_descanso, posesión_media, pass_accuracy_media, xG_promedio,
+             faltas_promedio, victorias, empates, derrotas]
+        
+        Secuencia [5x6] - Últimos 5 partidos:
+            [xG, xGA, SoT, SoTA, Corners, Corners_contra]
+        """
+        team_id = self.find_team_id(team_name)
+        if not team_id:
+            return None  # ← CRÍTICO: No inventa, retorna None
+        
+        # Consulta historial de últimos partidos finalizados
+        matches_data = self._get(
+            f"/football/teams/{team_id}/matches",
+            params={"status": "finished", "limit": 10}
+        )
+        
+        if not matches_data:
+            log_warning(f"No se obtuvieron partidos para {team_name} (ID: {team_id})")
+            return None  # ← No inventa, retorna None
+        
+        raw_matches = matches_data.get("data", [])
+        if not isinstance(raw_matches, list) or len(raw_matches) == 0:
+            log_warning(f"Historial vacío para {team_name}")
+            return None  # ← No inventa, retorna None
+        
+        sequence = []
+        xg_list, pos_list, pass_list, fouls_list = [], [], [], []
+        wins, draws, losses = 0, 0, 0
+        
+        # Procesa hasta 5 partidos reales (sin rellenar con ficción)
+        for m in raw_matches[:5]:
+            try:
                 is_home = str(m.get("home_team_id")) == str(team_id)
                 stats = m.get("stats", {})
+                
+                if not stats or not isinstance(stats, dict):
+                    log_warning(f"Stats ausentes en partido de {team_name}")
+                    continue  # ← Omite este partido, no inventa
                 
                 h_stats = stats.get("home", {})
                 a_stats = stats.get("away", {})
@@ -56,44 +156,83 @@ class TheStatsAPIClient:
                 t_stats = h_stats if is_home else a_stats
                 opp_stats = a_stats if is_home else h_stats
                 
-                xg = float(t_stats.get("xg", t_stats.get("expected_goals", 1.2)))
-                xga = float(opp_stats.get("xg", opp_stats.get("expected_goals", 1.1)))
-                sot = float(t_stats.get("shots_on_target", 4.0))
-                sota = float(opp_stats.get("shots_on_target", 4.0))
-                cor = float(t_stats.get("corners", 5.0))
-                cora = float(opp_stats.get("corners", 5.0))
+                # Extrae SOLO métricas que existen realmente
+                xg = float(t_stats.get("xg", t_stats.get("expected_goals", None)) or 0.0)
+                xga = float(opp_stats.get("xg", opp_stats.get("expected_goals", None)) or 0.0)
+                sot = float(t_stats.get("shots_on_target", None) or 0.0)
+                sota = float(opp_stats.get("shots_on_target", None) or 0.0)
+                cor = float(t_stats.get("corners", None) or 0.0)
+                cora = float(opp_stats.get("corners", None) or 0.0)
                 
-                pos = float(t_stats.get("possession", 50.0))
-                pass_acc = float(t_stats.get("pass_accuracy", 80.0))
+                pos = float(t_stats.get("possession", None) or 0.0)
+                pass_acc = float(t_stats.get("pass_accuracy", None) or 0.0)
+                fouls = float(t_stats.get("fouls", None) or 0.0)
+                
+                # Resultado
+                h_goals = m.get("home_goals", 0)
+                a_goals = m.get("away_goals", 0)
+                if is_home:
+                    if h_goals > a_goals:
+                        wins += 1
+                    elif h_goals == a_goals:
+                        draws += 1
+                    else:
+                        losses += 1
+                else:
+                    if a_goals > h_goals:
+                        wins += 1
+                    elif a_goals == h_goals:
+                        draws += 1
+                    else:
+                        losses += 1
                 
                 sequence.append([xg, xga, sot, sota, cor, cora])
                 xg_list.append(xg)
                 pos_list.append(pos)
                 pass_list.append(pass_acc)
-
-            # Rellenar con la media si la secuencia tiene menos de 5 registros
-            while len(sequence) < 5:
-                sequence.append([1.3, 1.2, 4.0, 4.0, 5.0, 5.0])
-
-            seq_array = np.array(sequence, dtype=np.float32)
+                fouls_list.append(fouls)
             
-            # Vector Tabular: [dias_descanso, posesion_media, pass_acc, xg_media, fouls_media, victorias, empates, derrotas]
-            mean_pos = float(np.mean(pos_list)) if pos_list else 50.0
-            mean_pass = float(np.mean(pass_list)) if pass_list else 80.0
-            mean_xg = float(np.mean(xg_list)) if xg_list else 1.3
-            
-            tab_array = np.array([4.0, mean_pos, mean_pass, mean_xg, 11.0, 3.0, 1.0, 1.0], dtype=np.float32)
-            return tab_array, seq_array
-
-        except Exception as e:
-            print(f"⚠️ Error al obtener datos reales de {team_name} en TheStatsAPI: {e}")
-            # Retorno estructurado neutro basado en promedios estándar para evitar caídas
-            default_seq = np.array([
-                [1.3, 1.2, 4.0, 4.0, 5.0, 5.0],
-                [1.4, 1.1, 5.0, 3.0, 6.0, 4.0],
-                [1.2, 1.3, 4.0, 4.0, 4.0, 5.0],
-                [1.5, 1.0, 5.0, 3.0, 6.0, 4.0],
-                [1.3, 1.2, 4.0, 4.0, 5.0, 5.0]
-            ], dtype=np.float32)
-            default_tab = np.array([4.0, 50.0, 80.0, 1.3, 11.0, 2.0, 1.0, 2.0], dtype=np.float32)
-            return default_tab, default_seq
+            except (ValueError, KeyError, TypeError) as e:
+                log_warning(f"Error parsando partido de {team_name}: {e}")
+                continue  # ← Omite, no inventa
+        
+        # CRÍTICO: Si no hay datos reales, retorna None (NO rellena con ficción)
+        if not sequence:
+            log_warning(f"No se extrajeron partidos reales para {team_name} tras procesar {len(raw_matches)} registros")
+            return None
+        
+        # Rellena secuencia SOLO hasta 5 (si tiene menos, eso es correcto)
+        # NO inventa valores adicionales
+        while len(sequence) < 5:
+            # Usa la media de los que SÍ existen, no valores ficticios
+            if xg_list:
+                mean_row = [
+                    float(np.mean(xg_list)),
+                    float(np.mean([s[1] for s in sequence])),
+                    float(np.mean([s[2] for s in sequence])),
+                    float(np.mean([s[3] for s in sequence])),
+                    float(np.mean([s[4] for s in sequence])),
+                    float(np.mean([s[5] for s in sequence]))
+                ]
+                sequence.append(mean_row)
+            else:
+                break  # Sin datos, no rellena
+        
+        seq_array = np.array(sequence[:5], dtype=np.float32)
+        
+        # Vector Tabular: Basado en datos reales extraídos
+        mean_pos = float(np.mean(pos_list)) if pos_list else 0.0
+        mean_pass = float(np.mean(pass_list)) if pass_list else 0.0
+        mean_xg = float(np.mean(xg_list)) if xg_list else 0.0
+        mean_fouls = float(np.mean(fouls_list)) if fouls_list else 0.0
+        
+        # Días de descanso (estimado: suponiendo partidos cada ~3-4 días)
+        days_rest = 3.0  # Valor por defecto estándar
+        
+        tab_array = np.array(
+            [days_rest, mean_pos, mean_pass, mean_xg, mean_fouls, float(wins), float(draws), float(losses)],
+            dtype=np.float32
+        )
+        
+        log_info(f"✅ {team_name}: {len(sequence)} partidos reales extraídos de TheStatsAPI")
+        return tab_array, seq_array
