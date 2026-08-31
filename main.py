@@ -1,138 +1,152 @@
 import os
-import numpy as np
+import sys
 import pandas as pd
 from tabulate import tabulate
 
-from thestatsapi_client import TheStatsAPIClient
+from config import validate_environment, DEFAULT_BANKROLL, FRACTIONAL_KELLY, MIN_EV_THRESHOLD
 from odds_client import TheOddsAPIClient
+from thestatsapi_client import TheStatsAPIClient
 from ml_engine import HybridPredictor
 from probability_engine import ProbabilityEngine
-from config import DEFAULT_BANKROLL, FRACTIONAL_KELLY, MIN_EV_THRESHOLD, THESTATSAPI_KEY, ODDS_API_KEY
 
 def calculate_kelly(prob: float, odd: float, bankroll: float = DEFAULT_BANKROLL) -> float:
+    if odd <= 1.0: return 0.0
     b = odd - 1.0
     q = 1.0 - prob
     f = (b * prob - q) / b
-    if f <= 0:
-        return 0.0
-    return round(bankroll * f * FRACTIONAL_KELLY, 2)
+    return round(bankroll * f * FRACTIONAL_KELLY, 2) if f > 0 else 0.0
 
-def run_pipeline():
-    print("=" * 90)
-    print("🚀 INICIANDO PIPELINE QUANTITATIVO: TheStatsAPI + The Odds API + CatBoost + LSTM Momentum")
-    print("=" * 90)
+def run_real_time_pipeline():
+    print("=" * 110)
+    print("⚡ SISTEMA QUANTITATIVO DE FÚTBOL EN TIEMPO REAL (100% DATOS REALES)")
+    print("=" * 110)
 
-    # 1. Verificar estado de credenciales
-    has_keys = bool(THESTATSAPI_KEY and ODDS_API_KEY)
-    if not has_keys:
-        print("⚠️ API Keys no configuradas en GitHub Secrets. Ejecutando en Modo de Simulación de Alta Precisión...")
+    # 1. Validar presencia obligatoria de API Keys
+    validate_environment()
 
-    # 2. Inicializar Modelos
+    odds_client = TheOddsAPIClient()
+    stats_client = TheStatsAPIClient()
     predictor = HybridPredictor()
     prob_engine = ProbabilityEngine()
 
-    # 3. Secuencia temporal de rendimiento (5 partidos previos)
-    # [xG, xGA, TirosArco, TirosArco_Contra, Córners, Córners_Contra]
-    seq_home = np.array([
-        [2.2, 0.7, 8, 3, 7, 2],
-        [1.9, 1.0, 6, 4, 8, 4],
-        [2.6, 0.4, 9, 2, 9, 3],
-        [2.1, 1.2, 7, 5, 6, 5],
-        [3.1, 0.5, 11, 2, 11, 2] # Fuerte aceleración reciente (Momentum positivo)
-    ])
-    
-    seq_away = np.array([
-        [0.8, 1.9, 3, 7, 3, 8],
-        [1.1, 1.4, 4, 5, 4, 6],
-        [0.6, 2.3, 2, 8, 2, 9],
-        [1.3, 1.2, 5, 4, 5, 4],
-        [0.9, 2.0, 3, 7, 3, 8]
-    ])
+    # 2. Obtener los 10 partidos reales del día a nivel mundial
+    matches = odds_client.get_top_matches_of_the_day()
+    if not matches:
+        print("❌ No se encontraron partidos disponibles en The Odds API para el día de hoy.")
+        sys.exit(0)
 
-    home_tab = np.array([3, 160, 64.0, 11, 2.1, 0.7, 4, 1])
-    away_tab = np.array([4, -160, 36.0, 15, 0.9, 2.0, 1, 4])
-    
-    home_team = "Manchester City"
-    away_team = "Tottenham"
+    summary_rows = []
+    value_bets_rows = []
 
-    # 4. Inferencia con CatBoost + LSTM Momentum
-    home_preds = predictor.predict(home_tab, seq_home)
-    away_preds = predictor.predict(away_tab, seq_away)
-
-    total_xg = home_preds["xg"] + away_preds["xg"]
-    total_sot = home_preds["sot"] + away_preds["sot"]
-    total_corners = home_preds["corners"] + away_preds["corners"]
-
-    # 5. Modelado de Probabilidades Poisson
-    p_1x2 = prob_engine.calculate_1x2_probabilities(home_preds["xg"], away_preds["xg"])
-    p_goals_25 = prob_engine.calculate_over_under(total_xg, 2.5)
-    p_cor_95 = prob_engine.calculate_over_under(total_corners, 9.5)
-    p_sot_85 = prob_engine.calculate_over_under(total_sot, 8.5)
-
-    # 6. Cuotas de mercado
-    market_odds = {
-        "1X2: Ganador Local": (p_1x2["home"], 1.50, f"xG: {home_preds['xg']}"),
-        "1X2: Empate": (p_1x2["draw"], 4.75, "-"),
-        "1X2: Ganador Visitante": (p_1x2["away"], 6.80, f"xG: {away_preds['xg']}"),
-        "Goles: Más de 2.5": (p_goals_25["over"], 1.70, f"xG Total: {round(total_xg, 2)}"),
-        "Goles: Menos de 2.5": (p_goals_25["under"], 2.25, f"xG Total: {round(total_xg, 2)}"),
-        "Córners: Más de 9.5": (p_cor_95["over"], 1.95, f"Córners: {round(total_corners, 1)}"),
-        "Remates Arco: Más de 8.5": (p_sot_85["over"], 1.90, f"SoT: {round(total_sot, 1)}")
-    }
-
-    # 7. Construcción de Reporte de Apuestas de Valor (+EV)
-    rows = []
-    for market, (prob_model, odd, projection) in market_odds.items():
-        implied_p = 1.0 / odd
-        ev = ((prob_model * odd) - 1.0) * 100
-        stake = calculate_kelly(prob_model, odd, DEFAULT_BANKROLL)
-        is_value = ev >= MIN_EV_THRESHOLD
+    for idx, match in enumerate(matches, 1):
+        home = match.get("home_team", "Local")
+        away = match.get("away_team", "Visitante")
+        league = match.get("sport_league", "").replace("soccer_", "").replace("_", " ").title()
+        commence = match.get("commence_time", "").replace("T", " ")[:16]
         
-        rows.append({
-            "Mercado": market,
-            "Proyección Modelo": projection,
-            "Prob. Modelo": f"{round(prob_model * 100, 1)}%",
-            "Cuota": odd,
-            "Prob. Implícita": f"{round(implied_p * 100, 1)}%",
-            "Valor (+EV)": f"{'+' if ev > 0 else ''}{round(ev, 2)}%",
-            "Stake Kelly": f"€{stake}" if stake > 0 else "€0.00",
-            "Decisión": "🔥 APOSTAR" if is_value else "⏸️ PASAR"
+        print(f"[{idx}/10] Extrayendo datos de TheStatsAPI para: {home} vs {away}...")
+        
+        # 3. Consulta de métricas reales a TheStatsAPI
+        home_tab, home_seq = stats_client.get_team_real_metrics(home)
+        away_tab, away_seq = stats_client.get_team_real_metrics(away)
+
+        # 4. Inferencia con CatBoost + LSTM Momentum
+        h_pred = predictor.predict(home_tab, home_seq)
+        a_pred = predictor.predict(away_tab, away_seq)
+
+        tot_xg = round(h_pred["xg"] + a_pred["xg"], 2)
+        tot_sot = round(h_pred["sot"] + a_pred["sot"], 1)
+        tot_corners = round(h_pred["corners"] + a_pred["corners"], 1)
+
+        # 5. Probabilidades Poisson
+        p_1x2 = prob_engine.calculate_1x2(h_pred["xg"], a_pred["xg"])
+        p_goals = prob_engine.calculate_over_under(tot_xg, 2.5)
+
+        # 6. Cuotas reales de The Odds API
+        odds = odds_client.extract_best_odds(match)
+
+        # Tabla resumen
+        summary_rows.append({
+            "#": idx,
+            "Hora (UTC)": commence,
+            "Torneo": league,
+            "Partido": f"{home} vs {away}",
+            "xG Pred.": f"{h_pred['xg']} - {a_pred['xg']}",
+            "SoT": tot_sot,
+            "Córners": tot_corners,
+            "Prob. 1X2 (%)": f"{round(p_1x2['home']*100)}% / {round(p_1x2['draw']*100)}% / {round(p_1x2['away']*100)}%",
+            "Cuotas 1X2": f"{odds['home']} | {odds['draw']} | {odds['away']}" if odds['home'] > 0 else "N/D"
         })
 
-    df = pd.DataFrame(rows)
+        # 7. Evaluación de Apuestas de Valor (+EV)
+        markets = [
+            (f"{home} (Ganador Local)", p_1x2["home"], odds["home"]),
+            (f"Empate (X)", p_1x2["draw"], odds["draw"]),
+            (f"{away} (Ganador Visitante)", p_1x2["away"], odds["away"]),
+            ("Más de 2.5 Goles", p_goals["over"], odds["over_25"]),
+            ("Menos de 2.5 Goles", p_goals["under"], odds["under_25"])
+        ]
 
-    # 8. Mostrar en Terminal
-    table_str = tabulate(df, headers='keys', tablefmt='grid', showindex=False)
-    print(f"\nANÁLISIS DE ENCUENTRO: {home_team} vs {away_team}")
-    print(table_str)
+        for pick, prob, odd in markets:
+            if odd <= 1.0: 
+                continue
+            ev = ((prob * odd) - 1.0) * 100
+            if ev >= MIN_EV_THRESHOLD:
+                stake = calculate_kelly(prob, odd, DEFAULT_BANKROLL)
+                value_bets_rows.append({
+                    "Partido": f"{home} vs {away}",
+                    "Selección": pick,
+                    "Prob. ML": f"{round(prob*100, 1)}%",
+                    "Cuota Real": odd,
+                    "Valor (+EV)": f"+{round(ev, 2)}%",
+                    "Stake Sugerido": f"€{stake}"
+                })
 
-    # 9. Escribir reporte en Markdown para GitHub Actions Summary
-    report_md = f"""# 📊 Reporte Cuantitativo de Apuestas: {home_team} vs {away_team}
+    df_summary = pd.DataFrame(summary_rows)
+    df_value = pd.DataFrame(value_bets_rows)
 
-### 🧠 Modelos Utilizados:
-- **CatBoost Regressor:** Ajuste por variables estructurales y tabulares.
-- **LSTM con Momentum (PyTorch):** Inferencia sobre series temporales y aceleración reciente.
-- **Métricas Evaluadas:** Expected Goals ($xG$), Remates al Arco ($SoT$) y Córners.
+    # Impresión en terminal
+    print("\n" + "=" * 110)
+    print("📋 TABLA GENERAL: 10 PARTIDOS TOP DEL DÍA (DATOS EN TIEMPO REAL)")
+    print("=" * 110)
+    print(tabulate(df_summary, headers="keys", tablefmt="grid", showindex=False))
+
+    print("\n" + "=" * 110)
+    print("🔥 APUESTAS DE VALOR (+EV) DETECTADAS EN TIEMPO REAL:")
+    print("=" * 110)
+    if not df_value.empty:
+        print(tabulate(df_value, headers="keys", tablefmt="grid", showindex=False))
+    else:
+        print("ℹ️ El mercado se encuentra altamente eficiente hoy. No se detectaron cuotas con EV > +3.0%.")
+
+    # Guardar en Markdown y publicar en GitHub Actions Summary
+    report_md = f"""# ⚽ Reporte Cuantitativo en Tiempo Real: 10 Partidos Top del Día
+*Modelos: **CatBoost Regressor** + **LSTM con Momentum (PyTorch)** cruzados con **TheStatsAPI** y **The Odds API***
 
 ---
 
-### 📋 Tabla de Decisiones y Oportunidades (+EV):
+### 📊 1. Proyecciones Estadísticas en Directo
 
-{tabulate(df, headers='keys', tablefmt='github', showindex=False)}
+{tabulate(df_summary, headers="keys", tablefmt="github", showindex=False)}
 
 ---
-> 💡 *Nota de Gestión de Riesgo:* Los stakes recomendados aplican Criterio Kelly Fraccional (25%) sobre un bankroll base de **€{DEFAULT_BANKROLL}**.
+
+### 🎯 2. Apuestas con Valor Positivo (+EV) Detectadas
+
+{tabulate(df_value, headers="keys", tablefmt="github", showindex=False) if not df_value.empty else "No hay oportunidades con EV > +3% en este momento."}
+
+---
+> 💡 *Nota:* Todas las cuotas y estadísticas fueron extraídas en vivo. La gestión monetaria aplica **Criterio Kelly Fraccional (25%)**.
 """
 
     with open("output_report.md", "w", encoding="utf-8") as f:
         f.write(report_md)
 
-    # Integración nativa con GitHub Actions Summary
-    github_summary_path = os.getenv("GITHUB_STEP_SUMMARY")
-    if github_summary_path:
-        with open(github_summary_path, "a", encoding="utf-8") as f:
+    summary_path = os.getenv("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        with open(summary_path, "a", encoding="utf-8") as f:
             f.write(report_md)
-        print("✅ Reporte integrado con éxito en GitHub Actions Summary.")
+        print("\n✅ Reporte publicado en GitHub Actions Summary.")
 
 if __name__ == "__main__":
-    run_pipeline()
+    run_real_time_pipeline()
