@@ -1,9 +1,9 @@
-name: Football Quant Analyzer Pipeline
+name: Football Real-Time Quant Pipeline
 
 on:
-  workflow_dispatch: # Permite ejecutar manualmente con un clic
+  workflow_dispatch:
   schedule:
-    - cron: '0 8 * * *' # Se ejecuta automáticamente todos los días a las 08:00 UTC
+    - cron: '0 8 * * *'
 
 jobs:
   run-analyzer:
@@ -24,15 +24,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Ejecutar Modelos ML y Motor de Cuotas
+      - name: Ejecutar Extracción y Modelado con Datos Reales
         env:
           THESTATSAPI_KEY: ${{ secrets.THESTATSAPI_KEY }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           python main.py
 
-      - name: Guardar Reporte como Artefacto
+      - name: Guardar Reporte
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: reporte-apuestas-valor
+          name: reporte-apuestas-reales
           path: output_report.md
