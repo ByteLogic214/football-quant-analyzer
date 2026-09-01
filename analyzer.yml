@@ -1,0 +1,67 @@
+name: Football Quantitative Analyzer (Real-Time)
+
+on:
+  schedule:
+    - cron: '08 09 * * 1-5'  # 09:08 UTC Mon-Fri (08:08 Madrid)
+  workflow_dispatch:
+
+jobs:
+  quantitative_analysis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    permissions:
+      contents: read
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Validate environment variables
+        run: |
+          if [ -z "$THESTATSAPI_KEY" ]; then
+            echo "ERROR: THESTATSAPI_KEY no está configurado"
+            exit 1
+          fi
+          if [ -z "$ODDS_API_KEY" ]; then
+            echo "ERROR: ODDS_API_KEY no está configurado"
+            exit 1
+          fi
+          echo "✓ Credenciales validadas"
+        env:
+          THESTATSAPI_KEY: ${{ secrets.THESTATSAPI_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      
+      - name: Run real-time quantitative analysis
+        run: python main.py
+        env:
+          THESTATSAPI_KEY: ${{ secrets.THESTATSAPI_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: quantitative-report
+          path: output_report.md
+          retention-days: 30
+      
+      - name: Display summary
+        if: always()
+        run: |
+          if [ -f output_report.md ]; then
+            echo "✅ Análisis completado. Reporte disponible en artifacts."
+          else
+            echo "⚠️ No se generó reporte (posible falta de partidos o datos)."
+          fi
