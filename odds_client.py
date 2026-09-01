@@ -208,8 +208,8 @@ class TheOddsAPIClient:
                             best["draw"] = price
                 
                 elif m_key == "totals":
-                    point = out.get("point")
                     for out in outcomes:
+                        point = out.get("point")
                         name = out.get("name", "").lower()
                         price = float(out.get("price", 0.0))
                         
