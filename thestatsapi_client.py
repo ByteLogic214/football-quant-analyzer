@@ -72,7 +72,7 @@ class TheStatsAPIClient:
         log_error(f"Falló obtener datos después de {MAX_RETRIES} reintentos: {endpoint}")
         return None
 
-    def find_team_id(self, team_name: str) -> Optional[int]:
+    def find_team_id(self, team_name: str) -> Optional[str]:
         """
         Busca el ID real de un equipo en TheStatsAPI.
         
@@ -81,21 +81,25 @@ class TheStatsAPIClient:
         2. Si falla, busca por fuzzy matching
         
         Returns:
-            team_id si existe, None si no se encuentra
+            team_id (string) si existe, None si no se encuentra
         """
         # Intenta búsqueda directa
         data = self._get("/football/teams", params={"name": team_name})
         if data:
             teams = data.get("data", [])
             if isinstance(teams, list) and len(teams) > 0:
-                return teams[0].get("id")
+                team_id = teams[0].get("id")
+                log_info(f"Equipo '{team_name}' encontrado con ID: {team_id}")
+                return str(team_id)
         
         # Intenta búsqueda por query
         data = self._get(f"/football/teams/search", params={"query": team_name})
         if data:
             teams = data.get("data", [])
             if isinstance(teams, list) and len(teams) > 0:
-                return teams[0].get("id")
+                team_id = teams[0].get("id")
+                log_info(f"Equipo '{team_name}' encontrado (búsqueda) con ID: {team_id}")
+                return str(team_id)
         
         log_warning(f"Equipo '{team_name}' no encontrado en TheStatsAPI")
         return None
@@ -119,12 +123,19 @@ class TheStatsAPIClient:
         """
         team_id = self.find_team_id(team_name)
         if not team_id:
+            log_warning(f"No se pudo obtener ID para {team_name}")
             return None  # ← CRÍTICO: No inventa, retorna None
         
-        # Consulta historial de últimos partidos finalizados
+        # ✅ CORRECCIÓN: Usar endpoint /football/matches con query params
+        # Endpoint CORRECTO: /football/matches?team_id={team_id}&status=finished
         matches_data = self._get(
-            f"/football/teams/{team_id}/matches",
-            params={"status": "finished", "limit": 10}
+            "/football/matches",
+            params={
+                "team_id": team_id,
+                "status": "finished",
+                "per_page": 10,
+                "page": 1
+            }
         )
         
         if not matches_data:
